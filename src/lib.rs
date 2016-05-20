@@ -14,6 +14,7 @@ use iron::typemap::Key;
 use plugin::Pluggable;
 
 use url::form_urlencoded;
+use url::percent_encoding::percent_decode;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::*;
 use std::fmt;
@@ -40,8 +41,10 @@ pub struct UrlEncodedBody;
 pub enum UrlDecodingError{
     /// An error parsing the request body
     BodyError(bodyparser::BodyError),
-    /// An empty query string, either in body or url query
-    EmptyQuery
+    /// An empty query string, either in body or url query.
+    EmptyQuery,
+    /// A malformed query string, either in body or url query.
+    MalformedQuery
 }
 
 pub use UrlDecodingError::*;
@@ -56,7 +59,8 @@ impl StdError for UrlDecodingError {
     fn description(&self) -> &str {
         match *self {
             BodyError(ref err) => err.description(),
-            EmptyQuery => "Expected query, found empty string."
+            EmptyQuery => "Expected query, found empty string.",
+            MalformedQuery => "Malformed query string"
         }
     }
 
@@ -104,17 +108,23 @@ impl<'a, 'b> plugin::Plugin<Request<'a, 'b>> for UrlEncodedBody {
 
 /// Parse a urlencoded string into an optional HashMap.
 fn create_param_hashmap(data: &str) -> QueryResult {
-    match data {
-        "" => Err(UrlDecodingError::EmptyQuery),
-        _ => Ok(combine_duplicates(form_urlencoded::parse(data.as_bytes())))
+    if data.is_empty() {
+        return Err(UrlDecodingError::EmptyQuery);
     }
+
+    let data = match percent_decode(data.as_bytes()).decode_utf8() {
+        Ok(data) => data,
+        Err(_) => return Err(UrlDecodingError::MalformedQuery)
+    };
+
+    Ok(combine_duplicates(form_urlencoded::parse(data.as_bytes())))
 }
 
 /// Convert a list of (key, value) pairs into a hashmap with vector values.
-fn combine_duplicates(q: Vec<(String, String)>) -> QueryMap {
+fn combine_duplicates(q: form_urlencoded::Parse) -> QueryMap {
     let mut deduplicated: QueryMap = HashMap::new();
 
-    for (k, v) in q.into_iter() {
+    for (k, v) in q.into_owned().into_iter() {
         match deduplicated.entry(k) {
             // Already a Vec here, push onto it
             Occupied(entry) => { entry.into_mut().push(v); },
@@ -129,13 +139,23 @@ fn combine_duplicates(q: Vec<(String, String)>) -> QueryMap {
 
 #[test]
 fn test_combine_duplicates() {
-    let my_vec = vec![("band".to_string(), "arctic monkeys".to_string()),
-                      ("band".to_string(), "temper trap".to_string()),
-                      ("color".to_string(),"green".to_string())];
-    let answer = combine_duplicates(my_vec);
+    let data = "band=arctic_monkeys&band=temper_trap&color=green";
+    let answer = combine_duplicates(form_urlencoded::parse(data.as_bytes()));
     let mut control = HashMap::new();
     control.insert("band".to_string(),
-                   vec!["arctic monkeys".to_string(), "temper trap".to_string()]);
+                   vec!["arctic_monkeys".to_string(), "temper_trap".to_string()]);
     control.insert("color".to_string(), vec!["green".to_string()]);
+    assert_eq!(answer, control);
+}
+
+#[test]
+fn test_percent_decode() {
+    let data = "band=arctic+monkeys&anotherband=temper+trap";
+    let answer = create_param_hashmap(data).unwrap();
+    let mut control = HashMap::new();
+    control.insert("band".to_string(),
+                   vec!["arctic monkeys".to_string()]);
+    control.insert("anotherband".to_string(),
+                   vec!["temper trap".to_string()]);
     assert_eq!(answer, control);
 }
